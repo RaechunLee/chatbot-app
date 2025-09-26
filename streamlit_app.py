@@ -3,7 +3,7 @@ import streamlit as st
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.vectorstores import FAISS
 from langchain.chat_models import ChatOpenAI
-from langchain.document_loaders import PyPDFLoader
+from langchain.document_loaders import PyPDFLoader, TextLoader
 from langchain_community.chat_message_histories import ChatMessageHistory
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain.tools.retriever import create_retriever_tool
@@ -41,30 +41,44 @@ def search_web():
         description="실시간 뉴스 및 웹 정보를 검색할 때 사용합니다. 결과는 제목+출처+링크+간단요약(snippet) 형태로 반환됩니다."
     )
 
-# ✅ PDF 업로드 → 벡터DB → 검색 툴 생성
-def load_pdf_files(uploaded_files):
+# ✅ 파일 업로드 → 벡터DB → 검색 툴 생성 (PDF, TXT 지원)
+def load_uploaded_files(uploaded_files):
     all_documents = []
     for uploaded_file in uploaded_files:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
-            tmp_file.write(uploaded_file.read())
-            tmp_file_path = tmp_file.name
+        file_extension = uploaded_file.name.split('.')[-1].lower()
 
-        loader = PyPDFLoader(tmp_file_path)
-        documents = loader.load()
-        all_documents.extend(documents)
+        if file_extension == 'pdf':
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
+                tmp_file.write(uploaded_file.read())
+                tmp_file_path = tmp_file.name
+            loader = PyPDFLoader(tmp_file_path)
+            documents = loader.load()
+            all_documents.extend(documents)
 
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-    split_docs = text_splitter.split_documents(all_documents)
+        elif file_extension in ['txt', 'text']:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".txt", mode='w+', encoding='utf-8') as tmp_file:
+                content = uploaded_file.read().decode('utf-8')
+                tmp_file.write(content)
+                tmp_file.flush()
+                tmp_file_path = tmp_file.name
+            loader = TextLoader(tmp_file_path, encoding='utf-8')
+            documents = loader.load()
+            all_documents.extend(documents)
 
-    vector = FAISS.from_documents(split_docs, OpenAIEmbeddings())
-    retriever = vector.as_retriever()
+    if all_documents:
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+        split_docs = text_splitter.split_documents(all_documents)
 
-    retriever_tool = create_retriever_tool(
-        retriever,
-        name="pdf_search",
-        description="Use this tool to search information from the pdf document"
-    )
-    return retriever_tool
+        vector = FAISS.from_documents(split_docs, OpenAIEmbeddings())
+        retriever = vector.as_retriever()
+
+        retriever_tool = create_retriever_tool(
+            retriever,
+            name="document_search",
+            description="업로드된 문서(PDF 및 텍스트 파일)에서 정보를 검색할 때 사용하는 도구입니다"
+        )
+        return retriever_tool
+    return None
 
 # ✅ Agent 대화 실행
 def chat_with_agent(user_input, agent_executor):
@@ -100,7 +114,25 @@ def main():
         st.session_state["OPENAI_API"] = st.text_input("OPENAI API 키", placeholder="Enter Your API Key", type="password")
         st.session_state["SERPAPI_API"] = st.text_input("SERPAPI_API 키", placeholder="Enter Your API Key", type="password")
         st.markdown('---')
-        pdf_docs = st.file_uploader("Upload your PDF Files", accept_multiple_files=True, key="pdf_uploader")
+
+        # LLM 모델 선택
+        model_options = [
+            "gpt-4o-mini",
+            "gpt-4o",
+            "gpt-4-turbo",
+            "gpt-4",
+            "gpt-3.5-turbo"
+        ]
+        selected_model = st.selectbox(
+            "LLM 모델 선택",
+            options=model_options,
+            index=0,  # gpt-4o-mini가 기본값
+            key="model_selector"
+        )
+        st.session_state["selected_model"] = selected_model
+
+        st.markdown('---')
+        uploaded_docs = st.file_uploader("파일 업로드 (PDF, TXT)", accept_multiple_files=True, type=['pdf', 'txt'], key="file_uploader")
 
     # ✅ 키 입력 확인
     if st.session_state["OPENAI_API"] and st.session_state["SERPAPI_API"]:
@@ -109,20 +141,22 @@ def main():
 
         # 도구 정의
         tools = []
-        if pdf_docs:
-            pdf_search = load_pdf_files(pdf_docs)
-            tools.append(pdf_search)
+        if uploaded_docs:
+            document_search = load_uploaded_files(uploaded_docs)
+            if document_search:
+                tools.append(document_search)
         tools.append(search_web())
 
-        # LLM 설정
-        llm = ChatOpenAI(model_name="gpt-4o-mini", temperature=0)
+        # LLM 설정 - 선택된 모델 사용
+        selected_model = st.session_state.get("selected_model", "gpt-4o-mini")
+        llm = ChatOpenAI(model_name=selected_model, temperature=0)
 
         prompt = ChatPromptTemplate.from_messages(
             [
                 ("system",
                 "Be sure to answer in Korean. You are a helpful assistant. "
-                "Make sure to use the `pdf_search` tool for searching information from the pdf document. "
-                "If you can't find the information from the PDF document, use the `web_search` tool for searching information from the web. "
+                "Make sure to use the `document_search` tool for searching information from uploaded documents (PDF or text files). "
+                "If you can't find the information from the uploaded documents, use the `web_search` tool for searching information from the web. "
                 "If the user’s question contains words like '최신', '현재', or '오늘', you must ALWAYS use the `web_search` tool to ensure real-time information is retrieved. "
                 "Please always include emojis in your responses with a friendly tone. "
                 "Your name is `AI 비서 톡톡이`. Please introduce yourself at the beginning of the conversation."),
